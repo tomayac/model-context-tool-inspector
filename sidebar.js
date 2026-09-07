@@ -4,6 +4,12 @@
  */
 
 import { GoogleGenAI } from './js-genai.js';
+import {
+  endConversation as endOnDeviceConversation,
+  initPromptApi,
+  promptOnDeviceAI,
+  promptOnDeviceModel,
+} from './prompt-api.js';
 import { getAllFrameOrigins } from './utils.js';
 
 const statusDiv = document.getElementById('status');
@@ -158,6 +164,13 @@ copyAsJSON.onclick = async () => {
 
 let genAI, chat;
 
+// Pseudo model id for the browser's built-in on-device model, exposed through
+// the Prompt API. Unlike the Gemini models it needs no API key.
+const PROMPT_API_MODEL = 'prompt-api';
+
+const isPromptApi = () => localStorage.model === PROMPT_API_MODEL;
+
+
 async function initGenAI() {
   let env;
   try {
@@ -173,9 +186,13 @@ async function initGenAI() {
   }
   localStorage.model ??= env?.model || 'gemini-3.6-flash';
   genAI = localStorage.apiKey ? new GoogleGenAI({ apiKey: localStorage.apiKey }) : undefined;
-  promptBtn.disabled = !localStorage.apiKey;
-  resetBtn.disabled = !localStorage.apiKey;
+  // The Prompt API needs no API key. Keep its buttons enabled even when the
+  // API is missing, so that clicking Send explains why it can't be used.
+  promptBtn.disabled = !isPromptApi() && !localStorage.apiKey;
+  resetBtn.disabled = promptBtn.disabled;
   apiKeyBtn.textContent = localStorage.apiKey ? 'Update Gemini API key' : 'Set Gemini API key';
+  // The on-device model has no API key to set.
+  apiKeyBtn.hidden = isPromptApi();
 
   suggestUserPromptCheckbox.checked = localStorage.suggestUserPrompt !== 'false';
 }
@@ -183,10 +200,11 @@ await initGenAI();
 
 document.querySelectorAll('input[name="model"]').forEach((radio) => {
   radio.checked = radio.value === localStorage.model;
-  radio.onclick = () => {
+  radio.onclick = async () => {
     localStorage.model = radio.value;
-    chat = undefined;
+    endConversation();
     advancedSection.hidePopover();
+    await initGenAI();
   };
 });
 
@@ -198,31 +216,40 @@ suggestUserPromptCheckbox.onchange = () => {
 
 async function suggestUserPrompt() {
   if (localStorage.suggestUserPrompt === 'false') return;
-  if (currentTools.length == 0 || !genAI || userPromptText.value !== lastSuggestedUserPrompt)
-    return;
+  if (currentTools.length == 0 || userPromptText.value !== lastSuggestedUserPrompt) return;
+  if (!isPromptApi() && !genAI) return;
   const userPromptId = ++userPromptPendingId;
-  const response = await genAI.models.generateContent({
-    model: localStorage.model,
-    contents: [
-      '**Context:**',
-      `Today's date is: ${getFormattedDate()}`,
-      '**Tool Rules:**',
-      '1. **Bank Transaction Filter:** Use **PAST** dates only (e.g., "last month," "December 15th," "yesterday").',
-      '2. **Flight Search:** Use **FUTURE** dates only (e.g., "next week," "February 15th").',
-      '3. **Accommodation Search:** Use **FUTURE** dates only (e.g., "next weekend," "March 15th").',
-      '**Task:**',
-      'Generate one natural user query for a range of tools below, ideally chaining them together.',
-      'Ensure the date makes sense relative to today.',
-      'Output the query text only.',
-      '**Tools:**',
-      JSON.stringify(currentTools),
-    ],
-  });
+  const contents = [
+    '**Context:**',
+    `Today's date is: ${getFormattedDate()}`,
+    '**Tool Rules:**',
+    '1. **Bank Transaction Filter:** Use **PAST** dates only (e.g., "last month," "December 15th," "yesterday").',
+    '2. **Flight Search:** Use **FUTURE** dates only (e.g., "next week," "February 15th").',
+    '3. **Accommodation Search:** Use **FUTURE** dates only (e.g., "next weekend," "March 15th").',
+    '**Task:**',
+    'Generate one natural user query for a range of tools below, ideally chaining them together.',
+    'Ensure the date makes sense relative to today.',
+    'Output the query text only.',
+    '**Tools:**',
+    JSON.stringify(currentTools),
+  ];
+  let text;
+  if (isPromptApi()) {
+    try {
+      text = await promptOnDeviceModel(contents.join('\n'));
+    } catch (error) {
+      // Suggestions are a nicety. Errors are reported when sending a prompt.
+      return;
+    }
+  } else {
+    const response = await genAI.models.generateContent({ model: localStorage.model, contents });
+    text = response.text;
+  }
   if (userPromptId !== userPromptPendingId || userPromptText.value !== lastSuggestedUserPrompt)
     return;
-  lastSuggestedUserPrompt = response.text;
+  lastSuggestedUserPrompt = text;
   userPromptText.value = '';
-  for (const chunk of response.text) {
+  for (const chunk of text) {
     await new Promise((r) => requestAnimationFrame(r));
     userPromptText.value += chunk;
   }
@@ -244,17 +271,31 @@ promptBtn.onclick = async () => {
   }
 };
 
-let trace = [];
+const trace = [];
+
+// What the on-device model needs from here: the tools of the page and how to
+// run one, the system instruction, where to write, and the trace to record
+// into.
+initPromptApi({
+  getTools: () => currentTools,
+  getSystemInstruction,
+  executeTool,
+  write,
+  trace,
+});
 
 async function promptAI() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-
-  chat ??= genAI.chats.create({ model: localStorage.model });
 
   const message = userPromptText.value;
   userPromptText.value = '';
   lastSuggestedUserPrompt = '';
   promptResults.textContent += `User prompt: "${message}"\n`;
+
+  if (isPromptApi()) return promptOnDeviceAI(tab.id, message);
+
+  chat ??= genAI.chats.create({ model: localStorage.model });
+
   const sendMessageParams = { message, config: getConfig() };
   trace.push({ userPrompt: sendMessageParams });
   let currentResult = await chat.sendMessage(sendMessageParams);
@@ -298,9 +339,15 @@ async function promptAI() {
   }
 }
 
-resetBtn.onclick = () => {
+// Ends the current conversation, whichever model backs it.
+function endConversation() {
   chat = undefined;
-  trace = [];
+  endOnDeviceConversation();
+}
+
+resetBtn.onclick = () => {
+  endConversation();
+  trace.length = 0;
   userPromptText.value = '';
   lastSuggestedUserPrompt = '';
   promptResults.textContent = '';
@@ -401,9 +448,13 @@ function updateDefaultValueForInputArgs() {
 
 // Utils
 
-function logPrompt(text) {
-  promptResults.textContent += `${text}\n`;
+function write(text) {
+  promptResults.textContent += text;
   promptResults.scrollTop = promptResults.scrollHeight;
+}
+
+function logPrompt(text) {
+  write(`${text}\n`);
 }
 
 function getFormattedDate() {
@@ -416,8 +467,8 @@ function getFormattedDate() {
   });
 }
 
-function getConfig() {
-  const systemInstruction = [
+function getSystemInstruction() {
+  return [
     'You are an assistant embedded in a browser tab.',
     'User prompts typically refer to the current tab unless stated otherwise.',
     'Use the provided tools to query page content when you need it.',
@@ -425,6 +476,10 @@ function getConfig() {
     'CRITICAL RULE: Whenever the user provides a relative date (e.g., "next Monday", "tomorrow", "in 3 days"),  you must calculate the exact calendar date based on today\'s date.',
     'CRITICAL RULE: Do not try to use other tools than the available ones.',
   ];
+}
+
+function getConfig() {
+  const systemInstruction = getSystemInstruction();
 
   const functionDeclarations = currentTools.map((tool) => {
     return {
